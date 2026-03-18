@@ -7,7 +7,13 @@ from data.fetchers import fetch_etf_data, calculate_returns, calculate_max_drawd
 
 
 def render():
-    st.markdown("## ETF Comparison Engine")
+    st.markdown(
+        '<div class="dashboard-header">'
+        '<div class="header-left">'
+        '<span style="color:#F0F0F5;font-weight:700;font-size:1.4rem;">ETF Comparison</span>'
+        '</div></div>',
+        unsafe_allow_html=True
+    )
     st.caption("Compare, analyze, and simulate SIP returns across war-economy ETFs")
 
     etf_options = {f"{v['name']} ({k.replace('.NS','')})": k for k, v in WAR_ECONOMY_ETFS.items()}

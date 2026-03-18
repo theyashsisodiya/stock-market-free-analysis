@@ -55,7 +55,13 @@ def _lumpsum_return(df, amount):
 
 
 def render():
-    st.markdown("## Portfolio Tracker & Simulator")
+    st.markdown(
+        '<div class="dashboard-header">'
+        '<div class="header-left">'
+        '<span style="color:#F0F0F5;font-weight:700;font-size:1.4rem;">Portfolio Tracker</span>'
+        '</div></div>',
+        unsafe_allow_html=True
+    )
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "Multi-ETF Simulator", "Lumpsum Calculator", "SIP Calculator", "Model Portfolios"
@@ -169,16 +175,36 @@ def render():
                             stackgroup="one",
                         ))
 
-            # Summary cards
+            # Colored summary cards
             total_pl = total_current - total_invested
             total_ret = ((total_current / total_invested) - 1) * 100 if total_invested > 0 else 0
 
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total Invested", format_inr(total_invested))
-            m2.metric("Current Value", format_inr(total_current))
-            m3.metric("Profit / Loss", format_inr(total_pl),
-                       delta=f"{'+' if total_ret >= 0 else ''}{total_ret:.2f}%")
-            m4.metric("Period", sim_period)
+            with m1:
+                st.markdown(
+                    f'<div class="summary-card blue">'
+                    f'<div class="sc-label">Total Invested</div>'
+                    f'<div class="sc-value">{format_inr(total_invested)}</div>'
+                    f'</div>', unsafe_allow_html=True)
+            with m2:
+                st.markdown(
+                    f'<div class="summary-card green">'
+                    f'<div class="sc-label">Current Value</div>'
+                    f'<div class="sc-value">{format_inr(total_current)}</div>'
+                    f'</div>', unsafe_allow_html=True)
+            with m3:
+                card_class = "green" if total_pl >= 0 else "red"
+                st.markdown(
+                    f'<div class="summary-card {card_class}">'
+                    f'<div class="sc-label">Profit / Loss</div>'
+                    f'<div class="sc-value">{"+" if total_pl >= 0 else ""}{format_inr(total_pl)}</div>'
+                    f'</div>', unsafe_allow_html=True)
+            with m4:
+                st.markdown(
+                    f'<div class="summary-card yellow">'
+                    f'<div class="sc-label">Total Return</div>'
+                    f'<div class="sc-value">{"+" if total_ret >= 0 else ""}{total_ret:.2f}%</div>'
+                    f'</div>', unsafe_allow_html=True)
 
             # Chart
             if fig.data:

@@ -5,61 +5,291 @@ import numpy as np
 import requests
 import feedparser
 import streamlit as st
+import json
+import logging
+import io
+from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+logger = logging.getLogger(__name__)
+
+PRICE_CACHE_PATH = Path(__file__).parent.parent / "alerts" / "price_cache.json"
+
+# --- Source Health Tracking ---
+_source_health = {
+    "yfinance": {"ok": True, "fail_count": 0, "skip_until": None},
+    "stooq": {"ok": True, "fail_count": 0, "skip_until": None},
+}
+
+
+def _is_source_available(name: str) -> bool:
+    """Check if a data source should be attempted (auto-skip after 3 failures)."""
+    h = _source_health.get(name, {"ok": True, "skip_until": None})
+    if h.get("skip_until") and datetime.now() < h["skip_until"]:
+        return False
+    return True
+
+
+def _record_failure(name: str) -> None:
+    """Record a source failure; skip source for 10 min after 3 consecutive failures."""
+    h = _source_health.setdefault(name, {"ok": True, "fail_count": 0, "skip_until": None})
+    h["fail_count"] = h.get("fail_count", 0) + 1
+    if h["fail_count"] >= 3:
+        h["ok"] = False
+        h["skip_until"] = datetime.now() + timedelta(minutes=10)
+        logger.warning("Source %s disabled for 10 min after %d failures", name, h["fail_count"])
+
+
+def _record_success(name: str) -> None:
+    """Reset source health on success."""
+    _source_health[name] = {"ok": True, "fail_count": 0, "skip_until": None}
+
+
+def get_source_health() -> dict:
+    """Get current health status of all data sources (for UI display)."""
+    return {
+        name: {"ok": h.get("ok", True), "fail_count": h.get("fail_count", 0)}
+        for name, h in _source_health.items()
+    }
+
+
+def _load_price_cache() -> dict:
+    """Load last-known prices from disk cache."""
+    try:
+        if PRICE_CACHE_PATH.exists():
+            return json.loads(PRICE_CACHE_PATH.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_price_cache(cache: dict) -> None:
+    """Persist price cache to disk."""
+    try:
+        PRICE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PRICE_CACHE_PATH.write_text(json.dumps(cache))
+    except Exception:
+        pass
+
+
+def get_cached_with_age(ticker: str) -> tuple:
+    """Returns (cached_data, hours_old) for stale cache detection."""
+    cache = _load_price_cache()
+    entry = cache.get(ticker, {})
+    if not entry or entry.get("price", 0) <= 0:
+        return {"price": 0, "change_pct": 0, "prev_close": 0}, float("inf")
+    cached_at_str = entry.get("cached_at", "2000-01-01T00:00:00")
+    try:
+        cached_at = datetime.fromisoformat(cached_at_str)
+    except (ValueError, TypeError):
+        cached_at = datetime(2000, 1, 1)
+    hours_old = (datetime.now() - cached_at).total_seconds() / 3600
+    return entry, hours_old
+
+
+def _stooq_ticker(ticker: str) -> str:
+    """Convert yfinance ticker to stooq format (e.g. GOLDBEES.NS → goldbees.in)."""
+    t = ticker.lower()
+    if t.endswith(".ns") or t.endswith(".bo"):
+        return t.rsplit(".", 1)[0] + ".in"
+    if t.startswith("^"):
+        return t[1:]
+    return t
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_stooq_ohlcv(ticker: str, period_days: int = 365) -> pd.DataFrame:
+    """Fetch OHLCV data from stooq.com CSV API as fallback."""
+    try:
+        stooq_sym = _stooq_ticker(ticker)
+        end = datetime.now()
+        start = end - timedelta(days=period_days)
+        url = (
+            f"https://stooq.com/q/d/l/"
+            f"?s={stooq_sym}"
+            f"&d1={start.strftime('%Y%m%d')}"
+            f"&d2={end.strftime('%Y%m%d')}"
+            f"&i=d"
+        )
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200 or "No data" in resp.text[:50]:
+            return pd.DataFrame()
+        df = pd.read_csv(io.StringIO(resp.text), parse_dates=["Date"], index_col="Date")
+        df = df.sort_index()
+        if df.empty or "Close" not in df.columns:
+            return pd.DataFrame()
+        logger.info("stooq fallback succeeded for %s", ticker)
+        return df
+    except Exception as e:
+        logger.debug("stooq fallback failed for %s: %s", ticker, e)
+        return pd.DataFrame()
+
+
+PERIOD_TO_DAYS = {
+    "5d": 10, "1mo": 35, "2mo": 70, "3mo": 100,
+    "6mo": 200, "1y": 370, "2y": 740, "5y": 1850, "max": 3650,
+}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_etf_data(ticker: str, period: str = "1y") -> pd.DataFrame:
-    """Fetch OHLCV data for a single ETF."""
-    try:
-        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
-        if df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        # Drop duplicate column names (e.g. 'Adj Close' and 'Close')
-        df = df.loc[:, ~df.columns.duplicated()]
-        return df
-    except Exception as e:
-        st.toast(f"Data fetch failed for {ticker}: {e}", icon="⚠️")
-        return pd.DataFrame()
+    """Fetch OHLCV data for a single ETF. Auto-skips broken sources."""
+    # Tier 1: yfinance
+    if _is_source_available("yfinance"):
+        try:
+            df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                df = df.loc[:, ~df.columns.duplicated()]
+                _record_success("yfinance")
+                return df
+            _record_failure("yfinance")
+        except Exception as e:
+            _record_failure("yfinance")
+            logger.warning("yfinance failed for %s: %s", ticker, e)
+
+    # Tier 2: stooq
+    if _is_source_available("stooq"):
+        try:
+            days = PERIOD_TO_DAYS.get(period, 370)
+            df = _fetch_stooq_ohlcv(ticker, period_days=days)
+            if not df.empty:
+                _record_success("stooq")
+                return df
+            _record_failure("stooq")
+        except Exception as e:
+            _record_failure("stooq")
+            logger.warning("stooq failed for %s: %s", ticker, e)
+
+    return pd.DataFrame()
+
+
+def _extract_price_from_df(ticker_df: pd.DataFrame) -> dict:
+    """Extract price, change_pct, prev_close from a ticker DataFrame."""
+    ticker_df = ticker_df.dropna(subset=["Close"])
+    if len(ticker_df) < 1:
+        return {"price": 0, "change_pct": 0, "prev_close": 0}
+    close_today = float(ticker_df["Close"].iloc[-1])
+    close_prev = float(ticker_df["Close"].iloc[-2]) if len(ticker_df) > 1 else close_today
+    change_pct = ((close_today - close_prev) / close_prev) * 100 if close_prev else 0
+    return {
+        "price": round(close_today, 2),
+        "change_pct": round(change_pct, 2),
+        "prev_close": round(close_prev, 2),
+    }
+
+
+def _fetch_single_stooq_price(ticker: str) -> dict:
+    """Fetch price for a single ticker via stooq fallback."""
+    df = _fetch_stooq_ohlcv(ticker, period_days=10)
+    if df.empty:
+        return {"price": 0, "change_pct": 0, "prev_close": 0}
+    return _extract_price_from_df(df)
 
 
 @st.cache_data(ttl=300, show_spinner="Fetching prices...")
 def fetch_batch_prices(tickers: tuple) -> dict:
-    """Single yfinance call for all tickers — 1 HTTP request instead of N."""
+    """Batch price fetch: yfinance → stooq → disk cache. Auto-skips broken sources."""
     results = {}
-    try:
-        df = yf.download(list(tickers), period="5d", progress=False,
-                         auto_adjust=True, group_by="ticker", threads=True)
-        if df.empty:
-            return {t: {"price": 0, "change_pct": 0, "prev_close": 0} for t in tickers}
-        for t in tickers:
-            try:
-                if len(tickers) == 1:
-                    ticker_df = df
-                    if isinstance(ticker_df.columns, pd.MultiIndex):
-                        ticker_df.columns = ticker_df.columns.get_level_values(0)
-                else:
-                    ticker_df = df[t]
-                ticker_df = ticker_df.dropna(subset=["Close"])
-                if len(ticker_df) < 1:
-                    results[t] = {"price": 0, "change_pct": 0, "prev_close": 0}
-                    continue
-                close_today = float(ticker_df["Close"].iloc[-1])
-                close_prev = float(ticker_df["Close"].iloc[-2]) if len(ticker_df) > 1 else close_today
-                change_pct = ((close_today - close_prev) / close_prev) * 100 if close_prev else 0
+    sources_used = {}
+    failed_tickers = list(tickers)
+
+    # --- Tier 1: yfinance batch ---
+    if _is_source_available("yfinance"):
+        try:
+            df = yf.download(list(tickers), period="5d", progress=False,
+                             auto_adjust=True, group_by="ticker", threads=True)
+            if not df.empty:
+                for t in tickers:
+                    try:
+                        if len(tickers) == 1:
+                            ticker_df = df
+                            if isinstance(ticker_df.columns, pd.MultiIndex):
+                                ticker_df.columns = ticker_df.columns.get_level_values(0)
+                        else:
+                            ticker_df = df[t]
+                        result = _extract_price_from_df(ticker_df)
+                        if result["price"] > 0:
+                            results[t] = result
+                            sources_used[t] = "yfinance"
+                            continue
+                    except Exception:
+                        pass
+                failed_tickers = [t for t in tickers if t not in results]
+                if results:
+                    _record_success("yfinance")
+                if failed_tickers:
+                    logger.info("yfinance missed %d tickers, trying stooq", len(failed_tickers))
+            else:
+                _record_failure("yfinance")
+        except Exception as e:
+            _record_failure("yfinance")
+            logger.warning("yfinance batch failed: %s", e)
+
+    # --- Tier 2: stooq individual fallback ---
+    if failed_tickers and _is_source_available("stooq"):
+        stooq_succeeded = False
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_map = {
+                executor.submit(_fetch_single_stooq_price, t): t
+                for t in failed_tickers
+            }
+            for future in as_completed(future_map):
+                t = future_map[future]
+                try:
+                    result = future.result()
+                    if result["price"] > 0:
+                        results[t] = result
+                        sources_used[t] = "stooq"
+                        stooq_succeeded = True
+                except Exception:
+                    pass
+        if stooq_succeeded:
+            _record_success("stooq")
+        else:
+            _record_failure("stooq")
+
+    # --- Tier 3: disk cache for anything still missing ---
+    still_missing = [t for t in tickers if t not in results]
+    if still_missing:
+        cache = _load_price_cache()
+        for t in still_missing:
+            cached = cache.get(t)
+            if cached and cached.get("price", 0) > 0:
+                logger.info("[%s] using cached price", t)
                 results[t] = {
-                    "price": round(close_today, 2),
-                    "change_pct": round(change_pct, 2),
-                    "prev_close": round(close_prev, 2),
+                    "price": cached["price"],
+                    "change_pct": cached.get("change_pct", 0),
+                    "prev_close": cached.get("prev_close", 0),
                 }
-            except Exception:
+                sources_used[t] = "cache"
+            else:
                 results[t] = {"price": 0, "change_pct": 0, "prev_close": 0}
-    except Exception:
-        for t in tickers:
-            results[t] = {"price": 0, "change_pct": 0, "prev_close": 0}
+
+    # --- Persist successful fetches to cache ---
+    cache = _load_price_cache()
+    updated = False
+    for t, data in results.items():
+        if data["price"] > 0 and sources_used.get(t) != "cache":
+            cache[t] = {
+                **data,
+                "source": sources_used.get(t, "unknown"),
+                "cached_at": datetime.now().isoformat(),
+            }
+            updated = True
+    if updated:
+        _save_price_cache(cache)
+
+    # Track primary source used for UI indicator
+    if sources_used:
+        primary = max(set(sources_used.values()), key=list(sources_used.values()).count)
+        try:
+            st.session_state["last_data_source"] = primary
+        except Exception:
+            pass
+
     return results
 
 

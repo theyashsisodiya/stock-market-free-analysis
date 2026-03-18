@@ -67,6 +67,13 @@ MACRO = {
     "nifty50":     "^NSEI",
 }
 
+# --- Data Source Configuration ---
+DATA_SOURCES = {
+    "yfinance": {"enabled": True, "max_retries": 3, "skip_minutes": 10},
+    "stooq": {"enabled": True, "max_retries": 3, "skip_minutes": 10},
+}
+CACHE_MAX_AGE_HOURS = 24
+
 # --- Thresholds ---
 ALERTS = {
     "gold_usd_high": 3000,
