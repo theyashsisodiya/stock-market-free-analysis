@@ -167,7 +167,13 @@ def fetch_etf_data(ticker: str, period: str = "1y") -> pd.DataFrame:
 
 
 def _extract_price_from_df(ticker_df: pd.DataFrame) -> dict:
-    """Extract price, change_pct, prev_close from a ticker DataFrame."""
+    """Extract latest price, daily change percentage, and previous close from OHLCV data.
+
+    Returns a dict with keys: price, change_pct, prev_close.
+    Returns zeroed dict if the DataFrame has no valid close prices.
+    """
+    if ticker_df.empty or "Close" not in ticker_df.columns:
+        return {"price": 0, "change_pct": 0, "prev_close": 0}
     ticker_df = ticker_df.dropna(subset=["Close"])
     if len(ticker_df) < 1:
         return {"price": 0, "change_pct": 0, "prev_close": 0}
